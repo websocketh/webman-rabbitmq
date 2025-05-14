@@ -3,15 +3,15 @@
 namespace Workbunny\WebmanRabbitMQ\Builders;
 
 use Bunny\Exception\ClientException;
-use Workbunny\WebmanRabbitMQ\Connections\MixConnection;
+use Workbunny\WebmanRabbitMQ\Connections\CoConnection;
 use Workbunny\WebmanRabbitMQ\Constants;
 use Workbunny\WebmanRabbitMQ\Exceptions\WebmanRabbitMQException;
 use Workerman\Worker;
-use Bunny\Channel as BunnyChannel;
-use Bunny\Async\Client as BunnyClient;
+use Workbunny\WebmanRabbitMQ\Clients\CoClient as BunnyClient;
+use Workbunny\WebmanRabbitMQ\Clients\Channels\Channel as BunnyChannel;
 use Bunny\Message as BunnyMessage;
 
-abstract class QueueBuilder extends AbstractBuilder
+abstract class CoQueueBuilder extends AbstractBuilder
 {
     /**
      * 队列配置
@@ -39,8 +39,7 @@ abstract class QueueBuilder extends AbstractBuilder
     public function __construct()
     {
         parent::__construct();
-        $this->setConnection(new MixConnection($this->config));
-
+        $this->setConnection(new CoConnection($this->config));
         $name = str_replace('\\', '.', get_called_class());
 
         $this->getBuilderConfig()->setConsumerTag($this->exchangeName ?? $name);
@@ -106,12 +105,12 @@ abstract class QueueBuilder extends AbstractBuilder
 namespace $namespace;
 
 use Bunny\Channel as BunnyChannel;
-use Bunny\Async\Client as BunnyClient;
+use Bunny\AbstractClient as BunnyClient;
 use Bunny\Message as BunnyMessage;
 use Workbunny\WebmanRabbitMQ\Constants;
-use Workbunny\WebmanRabbitMQ\Builders\QueueBuilder;
+use Workbunny\WebmanRabbitMQ\Builders\CoQueueBuilder;
 
-class $className extends QueueBuilder
+class $className extends CoQueueBuilder
 {
     /** @inheritdoc  */
     protected ?string \$connection = 'rabbitmq';

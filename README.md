@@ -87,11 +87,19 @@ composer require workbunny/webman-rabbitmq
 ```
 
 ### 配置
+
+#### app.php
+
 ```php
 <?php
 return [
     'enable' => true,
-
+    // 复用连接
+    'reuse_connection'   => false,
+    // 复用通道
+    'reuse_channel'      => false,
+    
+    // 以下内容2.2开始已弃用，请使用config/rabbitmq.php配置
     'host'               => 'rabbitmq',
     'vhost'              => '/',
     'port'               => 5672,
@@ -109,10 +117,7 @@ return [
     // 错误回调
     'error_callback'     => function(Throwable $throwable){
     },
-    // 复用连接
-    'reuse_connection'   => false,
-    // 复用通道
-    'reuse_channel'      => false,
+    
     // AMQPS 如需使用AMQPS请取消注释
 //    'ssl'                => [
 //        'cafile'      => 'ca.pem',
@@ -122,9 +127,48 @@ return [
 ];
 ```
 
-### QueueBuilder 
+#### rabbitmq.php
 
-- 可实现官网的5种消费模式
+**`Builder`中增加了`protected ?string $connection = null;`属性，用于指定使用`config/rabbitmq.php`中定义的连接**
+
+```php
+<?php
+return [
+    'connections' => [
+        'rabbitmq' => [
+            'host'               => 'rabbitmq',
+            'vhost'              => '/',
+            'port'               => 5672,
+            'username'           => 'guest',
+            'password'           => 'guest',
+            'mechanism'          => 'AMQPLAIN',
+            'timeout'            => 10,
+            // 重启间隔
+            'restart_interval'   => 0,
+            // 心跳间隔
+            'heartbeat'          => 50,
+            // 心跳回调
+            'heartbeat_callback' => function(){
+            },
+            // 错误回调
+            'error_callback'     => function(Throwable $throwable){
+            },
+//            // AMQPS 如需使用AMQPS请取消注释
+//            'ssl' => [
+//                'cafile' => 'ca.pem',
+//                'local_cert' => 'client.cert',
+//                'local_pk' => 'client.key',
+//            ],
+        ]
+    ]
+];
+```
+
+### QueueBuilder / CoQueueBuilder
+
+- QueueBuilder: 原队列Builder，采用event-loop实现异步消费
+- CoQueueBuilder: 协程队列Builder，采用协程实现异步消费，需要`workerman/rabbitmq 2.0`
+- 两种Builder均可实现官网的5种消费模式，使用方式一致，可平滑切换
 
 #### 命令行
 
@@ -149,6 +193,8 @@ return [
 ./webman workbunny:rabbitmq-builder project/testAll --mode=queue
 # 延迟同理
 ```
+
+**注：`CoQueueBuilder`请使用`--mode=co-queue`**
 
 - 移除
 
@@ -249,6 +295,8 @@ sync_publish(TestBuilder::instance(), 'abc', headers: [
 - 发布普通消息
 
 **注：向延迟队列发布普通消息会抛出一个 WebmanRabbitMQException 异常**
+
+**注：`CoQueueBuilder`不会返回`Promise`**
 
 ```php
 use function Workbunny\WebmanRabbitMQ\async_publish;

@@ -3,12 +3,21 @@
 namespace Workbunny\WebmanRabbitMQ\Builders;
 
 use Workbunny\WebmanRabbitMQ\BuilderConfig;
-use Workbunny\WebmanRabbitMQ\Connection;
+use Workbunny\WebmanRabbitMQ\Builders\Traits\BuilderConfigManagement;
+use Workbunny\WebmanRabbitMQ\Builders\Traits\ConnectionsManagement;
+use Workbunny\WebmanRabbitMQ\Connections\ConnectionInterface;
+use Workbunny\WebmanRabbitMQ\Exceptions\WebmanRabbitMQException;
 use Workerman\Worker;
 use function Workbunny\WebmanRabbitMQ\config;
 
 abstract class AbstractBuilder
 {
+    use ConnectionsManagement;
+    use BuilderConfigManagement;
+
+    /**
+     * @var bool
+     */
     public static bool $debug = false;
 
     /**
@@ -29,11 +38,12 @@ abstract class AbstractBuilder
     private static array $_builders = [];
 
     /**
-     * connection对象池
-     *
-     * @var Connection[]
+     * @var string[]
      */
-    private static array $_connections = [];
+    private static array $builderList = [
+        'queue'     => QueueBuilder::class,
+        'co-queue'  => CoQueueBuilder::class
+    ];
 
     /**
      * builder 名称
@@ -43,17 +53,28 @@ abstract class AbstractBuilder
     private ?string $_builderName = null;
 
     /**
-     * @var BuilderConfig
+     * 默认连接名
+     *
+     * @var string|null
      */
-    private BuilderConfig $_builderConfig;
+    protected ?string $connection = null;
+
+    /**
+     * @var array
+     */
+    protected array $config = [];
 
     public function __construct()
     {
         $this->setBuilderName(get_called_class());
-        $config = config('plugin.workbunny.webman-rabbitmq.app');
-        self::$reuseConnection = $config['reuse_connection'] ?? false;
-        self::$reuseChannel = $config['reuse_channel'] ?? false;
-        $this->setConnection(new Connection($config));
+        self::$reuseConnection = config('plugin.workbunny.webman-rabbitmq.app.reuse_connection', false);
+        self::$reuseChannel = config('plugin.workbunny.webman-rabbitmq.app.reuse_channel', false);
+        $this->config = $this->connection
+            ? config("plugin.workbunny.webman-rabbitmq.rabbitmq.connections.$this->connection", []) // 通过rabbitmq 配置文件配置
+            : config('plugin.workbunny.webman-rabbitmq.app', []); // 兼容旧版配置
+        if (!$this->config) {
+            throw new WebmanRabbitMQException('RabbitMQ config not found. ');
+        }
         $this->setBuilderConfig(new BuilderConfig());
     }
 
@@ -113,27 +134,14 @@ abstract class AbstractBuilder
     }
 
     /**
-     * 获取connections对象池
+     * 通过mode获取builder类名
      *
-     * @return Connection[]
+     * @param string $mode
+     * @return string|null
      */
-    public static function connections(): array
+    public static function getBuilderClass(string $mode): ?string
     {
-        return self::$_connections;
-    }
-
-    /**
-     * connection对象销毁
-     *
-     * @param string $builderName
-     * @return void
-     */
-    public static function connectionDestroy(string $builderName): void
-    {
-        if (self::$_connections[$builderName] ?? null) {
-            self::$_connections[$builderName]->disconnect(null);
-        }
-        unset(self::$_connections[$builderName]);
+        return static::$builderList[$mode] ?? null;
     }
 
     /**
@@ -153,39 +161,23 @@ abstract class AbstractBuilder
     }
 
     /**
-     * @return BuilderConfig
-     */
-    public function getBuilderConfig(): BuilderConfig
-    {
-        return $this->_builderConfig;
-    }
-
-    /**
-     * @param BuilderConfig $builderConfig
-     */
-    public function setBuilderConfig(BuilderConfig $builderConfig): void
-    {
-        $this->_builderConfig = $builderConfig;
-    }
-
-    /**
      * 获取连接
      *
-     * @return Connection|null
+     * @return ConnectionInterface|null
      */
-    public function getConnection(): ?Connection
+    public function getConnection(): ?ConnectionInterface
     {
-        return self::$_connections[self::isReuseConnection() ? '' : $this->getBuilderName()] ?? null;
+        return static::connectionGet(self::isReuseConnection() ? '' : $this->getBuilderName());
     }
 
     /**
      * 设置连接
      *
-     * @param Connection $connection
+     * @param ConnectionInterface $connection
      */
-    public function setConnection(Connection $connection): void
+    public function setConnection(ConnectionInterface $connection): void
     {
-        self::$_connections[self::isReuseConnection() ? '' : $this->getBuilderName()] = $connection;
+        static::connectionSet(self::isReuseConnection() ? '' : $this->getBuilderName(), $connection);
     }
 
     /**
