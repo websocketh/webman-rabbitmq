@@ -169,7 +169,10 @@ trait InitMethods
                     return $closure($channel);
                 } finally {
                     try {
-                        if ($channel->getState() === ChannelStateEnum::READY) {
+                        if ($this->getState() !== ClientStateEnum::CONNECTED) {
+                            // connection is dead, remove channel without putting back or closing
+                            $this->channelRemove($channel->id());
+                        } elseif ($channel->getState() === ChannelStateEnum::READY) {
                             $this->channels()->put($channel);
                         } else {
                             $this->channels()->closeConnection($channel);
@@ -181,7 +184,10 @@ trait InitMethods
                 Context::set('workbunny.webman-rabbitmq.channel', $channel);
                 Coroutine::defer(function () use ($channel) {
                     try {
-                        if ($channel->getState() === ChannelStateEnum::READY) {
+                        if ($this->getState() !== ClientStateEnum::CONNECTED) {
+                            // connection is dead, remove channel without putting back or closing
+                            $this->channelRemove($channel->id());
+                        } elseif ($channel->getState() === ChannelStateEnum::READY) {
                             $this->channels()->put($channel);
                         } else {
                             $this->channels()->closeConnection($channel);
@@ -236,10 +242,13 @@ trait InitMethods
                 /** @var MethodConnectionTuneFrame $tune */
                 $tune = $this->await(MethodConnectionTuneFrame::class);
                 $this->channelLimit = max(min($tune->channelMax, $this->channelLimit), 1);
-                // init channel ids
+                // init channel ids (clear first to avoid duplicates on reconnect)
+                $this->channelIds = [];
                 foreach (range(1, $this->channelLimit) as $i) {
                     $this->channelIds[] = $i;
                 }
+                // clear stale channels from previous connection
+                $this->channelUsedList = [];
                 $this->frameMax = max(min($tune->frameMax, $this->frameMax), 1);
                 // client heartbeat interval follow server
                 $this->heartbeatInterval = max(min($tune->heartbeat, $this->heartbeatInterval), 1);
@@ -315,6 +324,9 @@ trait InitMethods
                         "[$clientId <state:$state>] Connection closed.",
                         Constants::STATUS_CONNECTION_FORCED
                     ));
+                    // clean up tcpConnection so reconnect creates a fresh one
+                    $this->tcpConnection?->destroy();
+                    $this->tcpConnection = null;
                 }
             };
             // onError
@@ -328,6 +340,9 @@ trait InitMethods
                 }
                 $this->setState(ClientStateEnum::ERROR);
                 $this->wakeupAllAwaiting(new WebmanRabbitMQConnectException("[$clientId]: $msg", $code));
+                // clean up tcpConnection so reconnect creates a fresh one
+                $this->tcpConnection?->destroy();
+                $this->tcpConnection = null;
             };
             $this->tcpConnection->onBufferDrain = function (AsyncTcpConnection $connection) {
                 $clientId = $connection->clientId ?? 'NaN';

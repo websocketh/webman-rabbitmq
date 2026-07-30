@@ -449,6 +449,13 @@ class Channel
         }
         // closing or closed
         if (($frame instanceof MethodChannelCloseFrame) or ($frame instanceof MethodChannelCloseOkFrame)) {
+            // mark channel as closed so pending operations don't proceed
+            $this->setState(ChannelStateEnum::CLOSED);
+            // wakeup any coroutines awaiting on this channel with an exception
+            $this->connection->wakeupAllAwaiting(
+                new WebmanRabbitMQException('Channel [' . $this->id() . '] was closed by server.'),
+                $this->id()
+            );
             $this->connection->channels()->closeConnection($this);
 
             return;

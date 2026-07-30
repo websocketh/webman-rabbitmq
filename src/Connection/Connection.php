@@ -206,15 +206,15 @@ class Connection implements ConnectionInterface
      * wakeup all awaiting coroutines with an exception when connection is broken
      *
      * @param \Throwable $exception
-     * @param bool $withMasterChannel
+     * @param int|null $channel
      * @return void
      */
-    public function wakeupAllAwaiting(\Throwable $exception, bool $withMasterChannel = true): void
+    public function wakeupAllAwaiting(\Throwable $exception, ?int $channel = null): void
     {
-        foreach ($this->awaits as $channel => $queue) {
-            if (!$withMasterChannel and $channel === Constants::CONNECTION_CHANNEL) {
-                continue;
-            }
+        $awaits = $channel === null ? $this->awaits : [
+            $channel => $this->awaits[$channel] ?? [],
+        ];
+        foreach ($awaits as $chn => $queue) {
             foreach ($queue as $frameClassOrEvent => $list) {
                 foreach ($list as $await) {
                     try {
@@ -223,9 +223,9 @@ class Connection implements ConnectionInterface
                     }
                 }
             }
-            unset($this->awaits[$channel]);
+            unset($this->awaits[$chn]);
         }
-        $this->awaits = [];
+        $channel === null && $this->awaits = [];
     }
 
     /** @inheritDoc */

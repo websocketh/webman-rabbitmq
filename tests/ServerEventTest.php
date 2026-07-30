@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Workbunny\Tests;
 
 use Bunny\ClientStateEnum;
+use Workbunny\Tests\TestBuilders\TestConsumeBuilder;
 use Workbunny\Tests\TestBuilders\TestPublishBuilder;
 use Workbunny\WebmanRabbitMQ\Connection\ConnectionInterface;
 use Workbunny\WebmanRabbitMQ\ConnectionsManagement;
@@ -65,7 +66,6 @@ class ServerEventTest extends BaseTestCase
                 ?? $conn['client_properties']['connection_name']
                 ?? null;
             if ($clientId === $connectionId) {
-                // rawurlencode for path segments (spaces become %20, not +)
                 @$this->request('/api/connections/' . rawurlencode($conn['name']), 'DELETE');
 
                 return;
@@ -90,6 +90,19 @@ class ServerEventTest extends BaseTestCase
     }
 
     /**
+     * 获取当前连接并关闭它，等待状态变为 ERROR
+     */
+    protected function closeConnectionAndWait(): void
+    {
+        $connection = ConnectionsManagement::get();
+        $connId = $connection->id();
+        $this->closeConnectionViaApi($connId);
+        $this->waitConnectionState($connection, ClientStateEnum::ERROR, 5);
+        ConnectionsManagement::release($connection);
+        Timer::sleep(1);
+    }
+
+    /**
      * 测试：server 关闭连接后，下一次 publish 能自动重连并成功
      *
      * 结果：断开前 publish 成功 → 断开 → 重连后 publish 成功 → 两条消息都在
@@ -102,12 +115,8 @@ class ServerEventTest extends BaseTestCase
         $res1 = \Workbunny\WebmanRabbitMQ\publish($builder, 'before-close');
         $this->assertTrue($res1 > 0);
 
-        // 获取当前连接并关闭
-        $connection = ConnectionsManagement::get();
-        $this->closeConnectionViaApi($connection->id());
-        $this->waitConnectionState($connection, ClientStateEnum::ERROR, 5);
-        ConnectionsManagement::release($connection);
-        Timer::sleep(1);
+        // 关闭连接
+        $this->closeConnectionAndWait();
 
         // 重连后 publish
         $res2 = \Workbunny\WebmanRabbitMQ\publish($builder, 'after-close');
@@ -119,6 +128,33 @@ class ServerEventTest extends BaseTestCase
         $this->assertCount(2, $messages);
         $this->assertEquals('before-close', $messages[0]['payload']);
         $this->assertEquals('after-close', $messages[1]['payload']);
+    }
+
+    /**
+     * 测试：断开重连后连续 publish 多条都成功
+     *
+     * 结果：断开 → 重连 → 连续 5 条 publish 全部成功 → 消息全在
+     */
+    public function testMultiplePublishAfterReconnect(): void
+    {
+        $builder = new TestPublishBuilder();
+
+        // 初始 publish 建立连接
+        \Workbunny\WebmanRabbitMQ\publish($builder, 'msg-1');
+
+        // 关闭连接
+        $this->closeConnectionAndWait();
+
+        // 重连后连续 publish
+        for ($i = 2; $i <= 5; $i++) {
+            $res = \Workbunny\WebmanRabbitMQ\publish($builder, "msg-{$i}");
+            $this->assertTrue($res > 0, "Publish msg-{$i} failed after reconnect");
+        }
+
+        // 验证全部消息
+        Timer::sleep(2);
+        $messages = $this->getQueueMessages($builder->getBuilderConfig()->getQueue(), 5, true);
+        $this->assertCount(5, $messages);
     }
 
     /**
@@ -163,5 +199,134 @@ class ServerEventTest extends BaseTestCase
 
         // 所有 publish 协程都结束了（成功或异常），没有挂死
         $this->assertEquals(3, $completed, 'All concurrent publishes should complete without hang');
+    }
+
+    /**
+     * 测试：重连后 channel 池正常工作，不残留死 channel
+     *
+     * 结果：断开 → 重连 → 并发 publish 全部成功（channel 池健康）
+     */
+    public function testChannelPoolHealthyAfterReconnect(): void
+    {
+        $builder = new TestPublishBuilder();
+
+        // 建立连接
+        \Workbunny\WebmanRabbitMQ\publish($builder, 'before');
+
+        // 关闭连接
+        $this->closeConnectionAndWait();
+
+        // 重连后并发 publish — 验证 channel 池中没有死 channel
+        $count = 5;
+        $parallel = new Coroutine\Parallel();
+        for ($i = 0; $i < $count; $i++) {
+            $parallel->add(function () use ($builder, $i) {
+                $res = \Workbunny\WebmanRabbitMQ\publish($builder, "reconnect-{$i}");
+                \PHPUnit\Framework\assertTrue($res > 0, "Publish {$i} failed after reconnect");
+            });
+        }
+        $parallel->wait();
+
+        // 验证全部消息
+        Timer::sleep(2);
+        $messages = $this->getQueueMessages($builder->getBuilderConfig()->getQueue(), $count + 1, true);
+        $this->assertCount($count + 1, $messages);
+    }
+
+    /**
+     * 测试：多次断连重连循环，每次都能恢复
+     *
+     * 结果：3 轮 断开→重连→publish，每轮都成功
+     */
+    public function testMultipleReconnectCycles(): void
+    {
+        $builder = new TestPublishBuilder();
+        $rounds = 3;
+
+        for ($r = 0; $r < $rounds; $r++) {
+            // publish
+            $res = \Workbunny\WebmanRabbitMQ\publish($builder, "round-{$r}");
+            $this->assertTrue($res > 0, "Publish failed in round {$r}");
+
+            // 关闭连接
+            $this->closeConnectionAndWait();
+        }
+
+        // 验证全部消息
+        Timer::sleep(2);
+        $messages = $this->getQueueMessages($builder->getBuilderConfig()->getQueue(), $rounds, true);
+        $this->assertCount($rounds, $messages);
+        for ($r = 0; $r < $rounds; $r++) {
+            $this->assertEquals("round-{$r}", $messages[$r]['payload']);
+        }
+    }
+
+    /**
+     * 测试：重连后消费能正常工作
+     *
+     * 结果：断开 → 重连 → publish → 消费者收到消息
+     */
+    public function testConsumeAfterReconnect(): void
+    {
+        $log = __DIR__ . '/test-server-event-consume.log';
+        $builder = new TestConsumeBuilder();
+        TestConsumeBuilder::setLogFile($log);
+
+        try {
+            // 先 publish 一条建立连接
+            \Workbunny\WebmanRabbitMQ\publish($builder, 'consume-test');
+
+            // 关闭连接
+            $this->closeConnectionAndWait();
+
+            // 重连后启动消费者
+            $builder->onWorkerStart(new \Workerman\Worker());
+            Timer::sleep(3);
+
+            // publish 消息
+            \Workbunny\WebmanRabbitMQ\publish($builder, 'after-reconnect');
+            Timer::sleep(3);
+
+            // 验证消费
+            $this->assertTrue(file_exists($log));
+            $content = file_get_contents($log);
+            $this->assertNotEmpty($content);
+            $this->assertStringContainsString('after-reconnect', $content);
+        } finally {
+            @unlink($log);
+        }
+    }
+
+    /**
+     * 测试：断开重连后 action() 复用连接多次 publish
+     *
+     * 结果：断开 → 重连 → action 中多次 publish 全部成功
+     */
+    public function testActionAfterReconnect(): void
+    {
+        $builder = new TestPublishBuilder();
+
+        // 建立连接
+        \Workbunny\WebmanRabbitMQ\publish($builder, 'initial');
+
+        // 关闭连接
+        $this->closeConnectionAndWait();
+
+        // 重连后用 action 复用连接
+        $results = \Workbunny\WebmanRabbitMQ\action(function (ConnectionInterface $connection) use ($builder) {
+            $res1 = \Workbunny\WebmanRabbitMQ\publish($builder, 'action-1', connection: $connection);
+            $res2 = \Workbunny\WebmanRabbitMQ\publish($builder, 'action-2', connection: $connection);
+
+            return [$res1, $res2];
+        });
+
+        $this->assertCount(2, $results);
+        $this->assertTrue($results[0] > 0);
+        $this->assertTrue($results[1] > 0);
+
+        // 验证消息
+        Timer::sleep(2);
+        $messages = $this->getQueueMessages($builder->getBuilderConfig()->getQueue(), 3, true);
+        $this->assertCount(3, $messages);
     }
 }
