@@ -17,6 +17,7 @@ use Psr\Log\LoggerInterface;
 use Workbunny\WebmanRabbitMQ\Connection\Traits\ConnectionMethods;
 use Workbunny\WebmanRabbitMQ\Connection\Traits\InitMethods;
 use Workbunny\WebmanRabbitMQ\Connection\Traits\LoggerMethods;
+use Workbunny\WebmanRabbitMQ\Exceptions\WebmanRabbitMQConnectException;
 use Workbunny\WebmanRabbitMQ\Traits\ConfigMethods;
 use Workerman\Coroutine;
 use Workerman\Timer;
@@ -270,6 +271,13 @@ class Connection implements ConnectionInterface
                 Timer::del($this->heartbeat);
                 $this->heartbeat = 0;
             }
+            // wakeup all awaiting coroutines before closing channels,
+            // so they don't hang forever waiting for responses that will never arrive
+            $this->wakeupAllAwaiting(new WebmanRabbitMQConnectException(
+                '[' . ($this->id ?? 'NaN') . '] Connection is disconnecting.',
+                Constants::STATUS_CONNECTION_FORCED
+            ));
+
             // close channels & send connection.close (AMQP-level handshake, only if TCP is alive)
             if ($this->tcpConnection) {
                 try {

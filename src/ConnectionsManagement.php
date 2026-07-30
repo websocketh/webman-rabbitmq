@@ -110,6 +110,7 @@ class ConnectionsManagement implements Bootstrap
     {
         try {
             $instance = self::get($connection);
+            $instance->connect();
 
             return $action($instance);
         } finally {
