@@ -35,7 +35,7 @@ class Connection implements ConnectionInterface
     /** @var int state */
     protected int $state = ClientStateEnum::NOT_CONNECTED;
 
-    /** @var array<string, array<int, array{checker: callable|null, coroutine: Coroutine\Coroutine\CoroutineInterface, timestamp: float}>> $awaits */
+    /** @var array<int, array<int, array{checker: callable|null, coroutine: Coroutine\Coroutine\CoroutineInterface, timestamp: float}>> $awaits */
     protected array $awaits = [];
 
     /**
@@ -206,11 +206,15 @@ class Connection implements ConnectionInterface
      * wakeup all awaiting coroutines with an exception when connection is broken
      *
      * @param \Throwable $exception
+     * @param bool $withMasterChannel
      * @return void
      */
-    public function wakeupAllAwaiting(\Throwable $exception): void
+    public function wakeupAllAwaiting(\Throwable $exception, bool $withMasterChannel = true): void
     {
         foreach ($this->awaits as $channel => $queue) {
+            if (!$withMasterChannel and $channel === Constants::CONNECTION_CHANNEL) {
+                continue;
+            }
             foreach ($queue as $frameClassOrEvent => $list) {
                 foreach ($list as $await) {
                     try {
@@ -260,6 +264,13 @@ class Connection implements ConnectionInterface
         // wait for disconnect
         if ($this->state === ClientStateEnum::DISCONNECTING) {
             $this->await('connection.disconnected');
+            // wakeup all awaiting coroutines before closing channels,
+            // so they don't hang forever waiting for responses that will never arrive
+            $this->wakeupAllAwaiting(new WebmanRabbitMQConnectException(
+                '[' . ($this->id ?? 'NaN') . '] Connection is disconnecting.',
+                Constants::STATUS_CONNECTION_FORCED
+            ));
+            return;
         }
         // disconnect
         $replyCode = $options['replyCode'] ?? 0;
@@ -271,12 +282,6 @@ class Connection implements ConnectionInterface
                 Timer::del($this->heartbeat);
                 $this->heartbeat = 0;
             }
-            // wakeup all awaiting coroutines before closing channels,
-            // so they don't hang forever waiting for responses that will never arrive
-            $this->wakeupAllAwaiting(new WebmanRabbitMQConnectException(
-                '[' . ($this->id ?? 'NaN') . '] Connection is disconnecting.',
-                Constants::STATUS_CONNECTION_FORCED
-            ));
 
             // close channels & send connection.close (AMQP-level handshake, only if TCP is alive)
             if ($this->tcpConnection) {
@@ -310,12 +315,24 @@ class Connection implements ConnectionInterface
         // connection receive
         if ($frame instanceof MethodConnectionCloseFrame) {
             $this->logger?->info('Connection closed by server: ' . $frame->replyText);
-            $this->disconnect([
-                'replyCode' => $frame->replyCode,
-                'replyText' => $frame->replyText,
-                'message'   => 'Connection closed by server. ',
-                'code'      => Constants::STATUS_CONNECTION_FORCED,
-            ]);
+            // respond with connection.close-ok (AMQP spec: client must reply close-ok, not send another close)
+            $this->connectionCloseOk();
+            // clean up without graceful handshake — server already initiated the close
+            if ($this->heartbeat) {
+                Timer::del($this->heartbeat);
+                $this->heartbeat = 0;
+            }
+            $this->wakeupAllAwaiting(new WebmanRabbitMQConnectException(
+                '[' . ($this->id ?? 'NaN') . '] Connection closed by server: ' . $frame->replyText,
+                Constants::STATUS_CONNECTION_FORCED
+            ));
+            try {
+                $this->channels()?->closeConnections();
+            } catch (\Throwable) {
+            }
+            $this->tcpConnection?->destroy();
+            $this->tcpConnection = null;
+            $this->state = ClientStateEnum::NOT_CONNECTED;
 
             return;
         }
